@@ -66,6 +66,7 @@ import hudson.util.ProcessTree;
 import hudson.util.XStream2;
 
 import java.io.ByteArrayInputStream;
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -83,10 +84,13 @@ import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.Deque;
 import java.util.GregorianCalendar;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -1527,6 +1531,32 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         getParent().removeRun((RunT)this);
     }
 
+    /**
+     * Deque of closeable resources this Run instance has seen created for it, so that it can
+     * ensure they are closed at the end of execution
+     */
+    private final Deque<Closeable> observedCloseables = new LinkedList<Closeable>();
+
+    /**
+     * Close resources observed, as a last ditch attempt to clean up after ourselves.
+     */
+    private void closeObserved() throws IOException {
+        // Traverse the deque as a FILO stack, so that we unroll decorated resources in the reverse decorated order
+        for ( Iterator<Closeable> it = observedCloseables.descendingIterator(); it.hasNext(); ) {
+            Closeable resource = it.next();
+            // If the closeable is already closed, this is a no-op
+            resource.close();
+        }
+    }
+
+    /**
+     * Add a Closeable to the set of those known to be involved with this run, for later cleanup
+     * @param c Closable to observe
+     * @return true on success
+     */
+    private boolean observeCloseable(Closeable c) {
+        return observedCloseables.add(c);
+    }
 
     /**
      * @see CheckPoint#report()
@@ -1793,13 +1823,19 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
                 } catch (IOException e) {
                     LOGGER.log(Level.SEVERE, "Failed to save build record",e);
                 }
+
+                try {
+                    closeObserved();
+                } catch (IOException e) {
+                    LOGGER.log(Level.SEVERE, "Failed to close observed resource", e);
+                }
             }
 
             try {
                 getParent().logRotate();
             } catch (Exception e) {
-		LOGGER.log(Level.SEVERE, "Failed to rotate log",e);
-	    }
+                LOGGER.log(Level.SEVERE, "Failed to rotate log",e);
+            }
         } finally {
             onEndBuilding();
         }
@@ -1812,6 +1848,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         OutputStream logger;
         try {
             logger = Files.newOutputStream(getLogFile().toPath(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            observeCloseable(logger);
         } catch (InvalidPathException e) {
             throw new IOException(e);
         }
@@ -1820,6 +1857,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         // Global log filters
         for (ConsoleLogFilter filter : ConsoleLogFilter.all()) {
             logger = filter.decorateLogger(build, logger);
+            observeCloseable(logger);
         }
 
         // Project specific log filters
@@ -1827,6 +1865,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
             BuildableItemWithBuildWrappers biwbw = (BuildableItemWithBuildWrappers) project;
             for (BuildWrapper bw : biwbw.getBuildWrappersList()) {
                 logger = bw.decorateLogger((AbstractBuild) build, logger);
+                observeCloseable(logger);
             }
         }
 
